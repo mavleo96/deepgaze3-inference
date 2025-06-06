@@ -1,0 +1,10 @@
+orjson==3.10.15
+torch==2.4.1
+torchvision==0.19.1
+Pillow==10.0.0
+matplotlib==3.7.5
+ipython==8.12.2
+ipykernel==6.29.5
+isort==5.13.2
+black==24.8.0
+requests==2.32.3
