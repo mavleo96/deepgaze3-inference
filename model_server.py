@@ -40,18 +40,17 @@ if device.type == "cuda":
     app.logger.info("Model compiled.")
 
 
-def get_fixation_history(fixation_coordinates: List[List[int]]) -> np.ndarray:
-    """Extract fixation history for the model's included fixations."""
-    history = []
-    for item in fixation_coordinates:
-        item_history = []
-        for index in model.included_fixations:
-            try:
-                item_history.append(item[index])
-            except IndexError:
-                item_history.append(np.nan)
-        history.append(item_history)
-    return np.array(history)
+def process_stimulus(
+    stimulus_files: List[BytesIO],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Process a batch of items and return stacked tensors."""
+    image_arrays = [np.array(Image.open(f)) for f in stimulus_files]
+    image_tensor = torch.stack([transform(image) for image in image_arrays]).to(device)
+
+    B, _, H, W = image_tensor.shape
+    centerbias_tensor = torch.tensor(create_centerbias((H, W), B), device=device)
+
+    return image_tensor, centerbias_tensor
 
 
 def create_centerbias(stimulus_shape: Tuple[int, int], batch_size: int) -> np.ndarray:
@@ -71,21 +70,6 @@ def create_centerbias(stimulus_shape: Tuple[int, int], batch_size: int) -> np.nd
     return np.stack([centerbias] * batch_size, axis=0)
 
 
-def process_stimulus(
-    stimulus_files: List[BytesIO],
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Process a batch of items and return stacked tensors."""
-    # Process images
-    image_arrays = [np.array(Image.open(f)) for f in stimulus_files]
-    image_tensor = torch.stack([transform(image) for image in image_arrays]).to(device)
-
-    # Create centerbias
-    B, _, H, W = image_tensor.shape
-    centerbias_tensor = torch.tensor(create_centerbias((H, W), B), device=device)
-
-    return image_tensor, centerbias_tensor
-
-
 def process_fixations(
     x_hist: List[List[int]], y_hist: List[List[int]]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -95,22 +79,38 @@ def process_fixations(
     return x_hist_tensor, y_hist_tensor
 
 
+def get_fixation_history(fixation_coordinates: List[List[int]]) -> np.ndarray:
+    """Extract fixation history for the model's included fixations."""
+    history = []
+    for item in fixation_coordinates:
+        item_history = []
+        # Last 4 fixations from history reversed
+        for index in model.included_fixations:
+            try:
+                item_history.append(item[index])
+            except IndexError:
+                item_history.append(np.nan)
+        history.append(item_history)
+    return np.array(history)
+
+
 def sample_log_density(
     log_density: torch.Tensor, temperature: float = 1.0
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     B, _, H, W = log_density.shape
 
+    # Conditional log density with temperature
+    # Temperature is a hyperparameter that controls the randomness of the sampling
     scaled_log_density = log_density / temperature
     prob = torch.exp(scaled_log_density)
     prob = prob / prob.sum(dim=(2, 3), keepdim=True)
+
     flattened_prob = prob.reshape(B, 1, -1)
     sample = torch.distributions.Categorical(probs=flattened_prob).sample()
-    h, w = torch.unravel_index(sample, (H, W))
+    batch_h, batch_w = torch.unravel_index(sample, (H, W))
 
-    # Convert array coordinates to pixel coordinates
-    x, y = w, h
-
-    return x, y
+    # Return pixel coordinates
+    return batch_w, batch_h
 
 
 @app.route("/conditional_log_density", methods=["POST"])
@@ -160,23 +160,27 @@ def sample_fixations():
     image_tensor, centerbias_tensor = process_stimulus(stimulus_files)
     B, _, H, W = image_tensor.shape
 
+    # Fixation history is initialized with the center of the image in pixel coordinates
     x_hist_tensor = torch.tensor(
-        [[H // 2] + [np.nan] * (len(model.included_fixations) - 1)] * B, device=device
-    )
-    y_hist_tensor = torch.tensor(
         [[W // 2] + [np.nan] * (len(model.included_fixations) - 1)] * B, device=device
     )
+    y_hist_tensor = torch.tensor(
+        [[H // 2] + [np.nan] * (len(model.included_fixations) - 1)] * B, device=device
+    )
 
-    fixations = [[] for _ in range(B)]  # Create separate lists for each batch item
+    x_fixations = [[] for _ in range(B)]
+    y_fixations = [[] for _ in range(B)]
+    # We sample fixations sequentially conditioned on the previous fixations
     for _ in range(n_fixations):
         log_density = model(image_tensor, centerbias_tensor, x_hist_tensor, y_hist_tensor)
-        fix_h, fix_w = sample_log_density(log_density, temperature)
-        x_hist_tensor = torch.cat([fix_h, x_hist_tensor[:, :-1]], dim=1)
-        y_hist_tensor = torch.cat([fix_w, y_hist_tensor[:, :-1]], dim=1)
+        x_fix, y_fix = sample_log_density(log_density, temperature)
+        x_hist_tensor = torch.cat([x_fix, x_hist_tensor[:, :-1]], dim=1)
+        y_hist_tensor = torch.cat([y_fix, y_hist_tensor[:, :-1]], dim=1)
         for i in range(B):
-            fixations[i].append((fix_h[i].item(), fix_w[i].item()))
+            x_fixations[i].append(x_fix[i].item())
+            y_fixations[i].append(y_fix[i].item())
 
-    return orjson.dumps({"fixations": fixations})
+    return orjson.dumps({"x_fixations": x_fixations, "y_fixations": y_fixations})
 
 
 @app.route("/type", methods=["GET"])
