@@ -1,0 +1,9 @@
+gunicorn==23.0.0
+flask==3.0.0
+numpy==1.24.0
+orjson==3.10.15
+torch==2.4.1
+torchvision==0.19.1
+Pillow==10.0.0
+scipy==1.10.1
+git+https://github.com/matthias-k/deepgaze
