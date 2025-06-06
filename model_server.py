@@ -1,3 +1,4 @@
+import logging
 from io import BytesIO
 from typing import List, Tuple
 
@@ -13,7 +14,13 @@ from torchvision import transforms
 
 # Flask server
 app = Flask("deepgaze3-model-server")
-app.logger.setLevel("DEBUG")
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("deepgaze3-model-server")
+app.logger = logger
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -116,80 +123,105 @@ def sample_log_density(
 @app.route("/conditional_log_density", methods=["POST"])
 def conditional_log_density():
     """Handle conditional log density computation for batch requests."""
+    app.logger.info("Received conditional log density request")
+
     batch_data = orjson.loads(request.form["json_data"])
     stimulus_files = request.files.getlist("stimulus")
 
     # Validate input
     if not isinstance(batch_data, dict):
+        app.logger.error("Invalid request: missing x_hist and y_hist arrays")
         return orjson.dumps({"error": "Request must contain x_hist and y_hist arrays"}), 400
     if "x_hist" not in batch_data or not isinstance(batch_data["x_hist"], list):
+        app.logger.error("Invalid request: missing x_hist array")
         return orjson.dumps({"error": "Request must contain x_hist array"}), 400
     if "y_hist" not in batch_data or not isinstance(batch_data["y_hist"], list):
+        app.logger.error("Invalid request: missing y_hist array")
         return orjson.dumps({"error": "Request must contain y_hist array"}), 400
     if len(batch_data["x_hist"]) != len(batch_data["y_hist"]):
+        app.logger.error("Invalid request: x_hist and y_hist lengths mismatch")
         return orjson.dumps({"error": "x_hist and y_hist lengths must match"}), 400
     if len(stimulus_files) != len(batch_data["x_hist"]):
-        return (orjson.dumps({"error": "stimulus files and hist lengths must match"}), 400)
+        app.logger.error("Invalid request: stimulus files and hist lengths mismatch")
+        return orjson.dumps({"error": "stimulus files and hist lengths must match"}), 400
 
+    app.logger.info(f"Processing {len(stimulus_files)} stimuli")
     image_tensor, centerbias_tensor = process_stimulus(stimulus_files)
     x_hist_tensor, y_hist_tensor = process_fixations(batch_data["x_hist"], batch_data["y_hist"])
 
     log_density = model(image_tensor, centerbias_tensor, x_hist_tensor, y_hist_tensor)
-
+    app.logger.info("Successfully computed log density")
     return orjson.dumps({"log_density": log_density.cpu().tolist()})
 
 
 @app.route("/sample_fixations", methods=["POST"])
 def sample_fixations():
     """Sample fixations from log density."""
+    app.logger.info("Received sample fixations request")
     try:
-        n_fixations = int(request.form["n_fixations"])
+        size = int(request.form["size"])
+        n = int(request.form["n"])
         temperature = float(request.form.get("temperature", "1.0"))
     except (ValueError, KeyError) as e:
+        app.logger.error(f"Invalid parameters in sample fixations request: {str(e)}")
         return orjson.dumps({"error": f"Invalid parameter: {str(e)}"}), 400
 
-    if n_fixations <= 0:
-        return orjson.dumps({"error": "n_fixations must be a positive integer"}), 400
+    if size <= 0:
+        app.logger.error("Invalid size parameter: must be positive")
+        return orjson.dumps({"error": "size must be a positive integer"}), 400
+    if n <= 0:
+        app.logger.error("Invalid n parameter: must be positive")
+        return orjson.dumps({"error": "n must be a positive integer"}), 400
     if temperature <= 0:
+        app.logger.error("Invalid temperature parameter: must be positive")
         return orjson.dumps({"error": "temperature must be positive"}), 400
 
     stimulus_files = request.files.getlist("stimulus")
-    if len(stimulus_files) == 0:
-        return orjson.dumps({"error": "No stimulus files provided"}), 400
+    if len(stimulus_files) != 1:
+        app.logger.error("Invalid number of stimulus files")
+        return orjson.dumps({"error": "Exactly one stimulus file must be provided"}), 400
 
+    app.logger.info(f"Sampling {n} fixations for {size} sequences with temperature {temperature}")
+
+    # Expand tensors to size
     image_tensor, centerbias_tensor = process_stimulus(stimulus_files)
-    B, _, H, W = image_tensor.shape
+    image_tensor = image_tensor.expand(size, -1, -1, -1)
+    centerbias_tensor = centerbias_tensor.expand(size, -1, -1)
 
     # Fixation history is initialized with the center of the image in pixel coordinates
+    _, _, H, W = image_tensor.shape
     x_hist_tensor = torch.tensor(
-        [[W // 2] + [np.nan] * (len(model.included_fixations) - 1)] * B, device=device
+        [[W // 2] + [np.nan] * (len(model.included_fixations) - 1)] * size, device=device
     )
     y_hist_tensor = torch.tensor(
-        [[H // 2] + [np.nan] * (len(model.included_fixations) - 1)] * B, device=device
+        [[H // 2] + [np.nan] * (len(model.included_fixations) - 1)] * size, device=device
     )
 
-    x_fixations = [[] for _ in range(B)]
-    y_fixations = [[] for _ in range(B)]
+    x_fixations = [[] for _ in range(size)]
+    y_fixations = [[] for _ in range(size)]
     # We sample fixations sequentially conditioned on the previous fixations
-    for _ in range(n_fixations):
+    for _ in range(n):
         log_density = model(image_tensor, centerbias_tensor, x_hist_tensor, y_hist_tensor)
         x_fix, y_fix = sample_log_density(log_density, temperature)
         x_hist_tensor = torch.cat([x_fix, x_hist_tensor[:, :-1]], dim=1)
         y_hist_tensor = torch.cat([y_fix, y_hist_tensor[:, :-1]], dim=1)
-        for i in range(B):
+        for i in range(size):
             x_fixations[i].append(x_fix[i].item())
             y_fixations[i].append(y_fix[i].item())
 
+    app.logger.info("Successfully sampled fixations")
     return orjson.dumps({"x_fixations": x_fixations, "y_fixations": y_fixations})
 
 
 @app.route("/type", methods=["GET"])
 def type():
     """Return model type and version information."""
+    app.logger.info("Received type request")
     return orjson.dumps({"type": "DeepGazeIII", "version": "v1.1.0"})
 
 
 def main():
+    app.logger.info("Starting DeepGazeIII model server")
     app.run(host="localhost", port="4000", debug="True", threaded=True)
 
 
